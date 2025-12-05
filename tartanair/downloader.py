@@ -145,7 +145,7 @@ class HuggingfaceDownloader(object):
         self.chunk_size = 100  # Number of files to download per chunk from Hugging Face
 
         if bucket_name == 'tartanair2':
-            pass
+            self.repo_id = "theairlabcmu/tartanair2"
         elif bucket_name == 'tartanground':
             self.repo_id = "theairlabcmu/TartanGround"
         else:
