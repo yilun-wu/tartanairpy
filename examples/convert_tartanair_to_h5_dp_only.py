@@ -1,12 +1,7 @@
 '''
-Author: Claude
-Date: 2025-12-10
-
 Script to convert TartanAir V2 data to H5 format.
 Saves RGB, Depth, and Pose in a single H5 file per sequence.
 Flow is generated on-the-fly by users from depth+pose.
-
-Reads files directly from zip archives without extracting to disk.
 
 Output structure:
 - Combined: {env}.{difficulty}.{traj}.{camera}.h5
@@ -16,6 +11,7 @@ Output structure:
 import h5py
 import hdf5plugin
 import numpy as np
+import os
 import cv2
 from PIL import Image
 from tqdm import tqdm
@@ -54,44 +50,50 @@ class TartanAirH5Converter:
         self.output_dir = Path(output_dir) if output_dir else self.root_dir
         self.reader = TartanAirImageReader()
 
-    def read_decode_depth_from_bytes(self, depth_bytes):
-        """Read and decode depth from RGBA PNG bytes."""
-        depth_array = np.frombuffer(depth_bytes, dtype=np.uint8)
-        depth_rgba = cv2.imdecode(depth_array, cv2.IMREAD_UNCHANGED)
+    def read_decode_depth(self, depth_path):
+        """Read and decode depth from RGBA PNG format."""
+        depth_rgba = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
         depth = depth_rgba.view("<f4")
         return np.squeeze(depth, axis=-1)
 
-    def write_rgbd_pose_h5(self, image_zip, depth_zip, env_name, difficulty, traj_name, h5_path, camera_name):
+    def read_pose(self, pose_path):
+        """Read pose file (Nx7: x, y, z, qx, qy, qz, qw)."""
+        poses = np.loadtxt(str(pose_path), dtype=np.float64)
+        return poses
+
+    def write_rgbd_pose_h5(self, seq_path, h5_path, camera_name):
         """
-        Write RGB, Depth, and Pose to a single H5 file by reading directly from zip files.
+        Write RGB, Depth, and Pose to a single H5 file.
 
         Args:
-            image_zip: ZipFile object for RGB images
-            depth_zip: ZipFile object for depth images
-            env_name: Environment name (e.g., "AbandonedFactory")
-            difficulty: Difficulty level (e.g., "Data_easy")
-            traj_name: Trajectory name (e.g., "P000")
+            seq_path: Path to sequence directory (e.g., P008/)
             h5_path: Output H5 file path
             camera_name: Camera identifier
         """
-        # Find RGB files in zip for this trajectory
-        rgb_prefix = f"{env_name}/{difficulty}/{traj_name}/image_{camera_name}/"
-        rgb_files = sorted([name for name in image_zip.namelist()
-                           if name.startswith(rgb_prefix) and name.endswith('.png') and not name.endswith('/')])
+        rgb_dir = seq_path / f"image_{camera_name}"
+        depth_dir = seq_path / f"depth_{camera_name}"
+        pose_file = seq_path / f"pose_{camera_name}.txt"
 
-        # Find depth files in zip for this trajectory
-        depth_prefix = f"{env_name}/{difficulty}/{traj_name}/depth_{camera_name}/"
-        depth_files = sorted([name for name in depth_zip.namelist()
-                             if name.startswith(depth_prefix) and name.endswith('.png') and not name.endswith('/')])
+        # Check required files exist
+        if not rgb_dir.is_dir():
+            print(f"⚠ RGB directory not found: {rgb_dir}")
+            return
+        if not depth_dir.is_dir():
+            print(f"⚠ Depth directory not found: {depth_dir}")
+            return
+        if not pose_file.is_file():
+            print(f"⚠ Pose file not found: {pose_file}")
+            return
 
-        # Find pose file in zip
-        pose_file_path = f"{env_name}/{difficulty}/{traj_name}/pose_{camera_name}.txt"
+        # Get RGB and depth files
+        rgb_files = sorted([f for f in rgb_dir.glob("*.png") if not f.name.startswith(".")])
+        depth_files = sorted([f for f in depth_dir.glob("*.png") if not f.name.startswith(".")])
 
         if not rgb_files:
-            print(f"⚠ No RGB files found in zip for {traj_name}/image_{camera_name}")
+            print(f"No RGB files found in {rgb_dir}")
             return
         if not depth_files:
-            print(f"⚠ No depth files found in zip for {traj_name}/depth_{camera_name}")
+            print(f"No depth files found in {depth_dir}")
             return
 
         if len(rgb_files) != len(depth_files):
@@ -100,27 +102,13 @@ class TartanAirH5Converter:
 
         num_frames = len(rgb_files)
 
-        # Read pose file from zip
-        try:
-            with image_zip.open(pose_file_path) as pose_f:
-                poses = np.loadtxt(pose_f, dtype=np.float64)
-        except KeyError:
-            # Try depth zip if not in image zip
-            try:
-                with depth_zip.open(pose_file_path) as pose_f:
-                    poses = np.loadtxt(pose_f, dtype=np.float64)
-            except KeyError:
-                print(f"⚠ Pose file not found in zips: {pose_file_path}")
-                return
+        # Read pose
+        poses = self.read_pose(pose_file)
 
-        # Read first RGB and depth to get dimensions
-        with image_zip.open(rgb_files[0]) as f:
-            sample_rgb = Image.open(f)
-            W, H = sample_rgb.size
-
-        with depth_zip.open(depth_files[0]) as f:
-            depth_bytes = f.read()
-            sample_depth = self.read_decode_depth_from_bytes(depth_bytes)
+        # Read sample images for dimensions
+        sample_rgb = Image.open(rgb_files[0])
+        W, H = sample_rgb.size
+        sample_depth = self.read_decode_depth(depth_files[0])
 
         if sample_depth.shape != (H, W):
             print(f"⚠ RGB and depth dimensions don't match: RGB {(H, W)} vs depth {sample_depth.shape}")
@@ -130,7 +118,7 @@ class TartanAirH5Converter:
             # File-level attributes
             h5.attrs["camera_id"] = camera_name
             h5.attrs["dataset_name"] = "TartanAirV2"
-            h5.attrs["dataset_seq"] = f"{env_name}.{difficulty}.{traj_name}"
+            h5.attrs["dataset_seq"] = ".".join(seq_path.parts[-3:])
             h5.attrs["resolution"] = (H, W)
             h5.attrs["sensor"] = "synthetic"
             h5.attrs["window_duration_us"] = 100000
@@ -162,24 +150,21 @@ class TartanAirH5Converter:
                 compression=None
             )
 
-            # Write RGB and depth by reading from zip
+            # Write RGB and depth
             for i in tqdm(range(num_frames), desc=f"Writing RGB+Depth to {h5_path.name}", leave=False):
-                # Read and write RGB
-                with image_zip.open(rgb_files[i]) as f:
-                    rgb_img = Image.open(f)
-                    rgb_dset[i] = np.array(rgb_img)
+                # Write RGB
+                rgb_img = Image.open(rgb_files[i])
+                rgb_dset[i] = np.array(rgb_img)
 
-                # Read and write depth
-                with depth_zip.open(depth_files[i]) as f:
-                    depth_bytes = f.read()
-                    depth = self.read_decode_depth_from_bytes(depth_bytes)
-                    depth_dset[i] = depth
+                # Write depth
+                depth = self.read_decode_depth(depth_files[i])
+                depth_dset[i] = depth
 
         print(f"✓ Wrote {num_frames} RGB images, depths, and poses to {h5_path}")
 
     def process_env_sensor_pair(self, env_name, sensor_name, difficulty="Data_easy"):
         """
-        Process a single environment/sensor pair by reading directly from zip files.
+        Process a single environment/sensor pair.
 
         Args:
             env_name: Environment name (e.g., "AbandonedFactory")
@@ -199,64 +184,52 @@ class TartanAirH5Converter:
             return False
 
         # Find zip files for this sensor
-        depth_zip_path = env_dir / f"depth_{sensor_name}.zip"
-        image_zip_path = env_dir / f"image_{sensor_name}.zip"
+        depth_zip = env_dir / f"depth_{sensor_name}.zip"
+        image_zip = env_dir / f"image_{sensor_name}.zip"
 
-        if not depth_zip_path.exists() or not image_zip_path.exists():
-            print(f"⚠ Missing zip files for {env_name}/{sensor_name}")
+        if not depth_zip.exists() and not image_zip.exists():
+            print(f"⚠ No zip files found for {env_name}/{sensor_name}")
             return False
 
         try:
-            # Open zip files
-            with zipfile.ZipFile(image_zip_path, 'r') as image_zip, \
-                 zipfile.ZipFile(depth_zip_path, 'r') as depth_zip:
+            # Find all trajectory directories (containing pose files)
+            # After extraction, files should be under root_dir/{env}/{difficulty}/P00x/
+            pose_pattern = f"pose_{sensor_name}.txt"
+            search_dir = self.root_dir / env_name / difficulty
+            pose_files = list(search_dir.rglob(pose_pattern))
 
-                # Discover trajectories from zip contents
-                # Look for pose files in the zip to identify trajectories
-                pose_pattern = f"{env_name}/{difficulty}/"
-                trajectories = set()
+            # Get unique sequence paths
+            unique_seq_paths = list(set([pf.parent for pf in pose_files]))
 
-                for name in image_zip.namelist():
-                    if f"pose_{sensor_name}.txt" in name and name.startswith(pose_pattern):
-                        # Extract trajectory name from path like: "AbandonedFactory/Data_easy/P000/pose_lcam_front.txt"
-                        parts = Path(name).parts
-                        if len(parts) >= 3:
-                            traj_name = parts[2]  # P000, P001, etc.
-                            if traj_name.startswith('P') and len(traj_name) == 4:
-                                trajectories.add(traj_name)
+            if not unique_seq_paths:
+                print(f"⚠ No sequences found for {env_name}/{sensor_name}")
+                return False
 
-                if not trajectories:
-                    print(f"⚠ No trajectories found in {env_name}/{sensor_name}")
-                    return False
+            print(f"Found {len(unique_seq_paths)} trajectories")
 
-                print(f"Found {len(trajectories)} trajectories: {sorted(trajectories)}")
+            # Process each trajectory
+            for seq_path in sorted(unique_seq_paths):
+                traj_name = seq_path.name  # e.g., P000
 
-                # Process each trajectory
-                for traj_name in sorted(trajectories):
-                    # Construct output path for combined H5 file
-                    # Output directly under root output directory (e.g., /data/tartanair/)
-                    h5_name = f"{env_name}.{difficulty}.{traj_name}.{sensor_name}.h5"
-                    h5_path = self.output_dir / h5_name
+                # Construct output path for combined H5 file
+                h5_name = f"{env_name}.{difficulty}.{traj_name}.{sensor_name}.h5"
+                h5_path = self.output_dir / env_name / difficulty / traj_name / h5_name
 
-                    try:
-                        print(f"\nProcessing trajectory: {traj_name}")
+                try:
+                    print(f"\nProcessing trajectory: {traj_name}")
 
-                        # Create output directory
-                        h5_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Create output directory
+                    h5_path.parent.mkdir(parents=True, exist_ok=True)
 
-                        # Process RGB+Depth+Pose from zip files
-                        if not h5_path.exists():
-                            self.write_rgbd_pose_h5(
-                                image_zip, depth_zip,
-                                env_name, difficulty, traj_name,
-                                h5_path, sensor_name
-                            )
-                        else:
-                            print(f"⊘ Skipping (already exists): {h5_path.name}")
+                    # Process RGB+Depth+Pose
+                    if not h5_path.exists():
+                        self.write_rgbd_pose_h5(seq_path, h5_path, sensor_name)
+                    else:
+                        print(f"⊘ Skipping (already exists): {h5_path.name}")
 
-                    except Exception as e:
-                        print(f"✗ Failed to process trajectory {traj_name}: {e}")
-                        raise  # Re-raise to allow debugger to catch
+                except Exception as e:
+                    print(f"✗ Failed to process trajectory {seq_path}: {e}")
+                    raise  # Re-raise to allow debugger to catch
 
             return True
 
@@ -355,7 +328,7 @@ if __name__ == "__main__":
     ROOT_DIR = Path("/data/tartanair")
     OUTPUT_DIR = ROOT_DIR  # Output to same directory
     DIFFICULTY = "Data_easy"
-    MAX_WORKERS = 6
+    MAX_WORKERS = 4
 
     # Create converter
     converter = TartanAirH5Converter(
@@ -364,14 +337,14 @@ if __name__ == "__main__":
     )
 
     # Option 1: Process a specific environment/sensor pair
-    # converter.process_env_sensor_pair(
-    #     env_name="AmericanDiner",
-    #     sensor_name="lcam_front",
-    #     difficulty=DIFFICULTY
-    # )
-
-    # Option 2: Process all environment/sensor pairs in parallel
-    converter.process_all_env_sensor_pairs(
-        max_workers=MAX_WORKERS,
+    converter.process_env_sensor_pair(
+        env_name="AbandonedFactory",
+        sensor_name="lcam_front",
         difficulty=DIFFICULTY
     )
+
+    # Option 2: Process all environment/sensor pairs in parallel
+    # converter.process_all_env_sensor_pairs(
+    #     max_workers=MAX_WORKERS,
+    #     difficulty=DIFFICULTY
+    # )
