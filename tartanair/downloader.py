@@ -183,6 +183,7 @@ class TartanAirDownloader(TartanAirModule):
 
         # self.downloader = CloudFlareDownloader()
         self.downloader = AirLabDownloader(bucket_name = 'tartanair2')
+        # self.downloader = HuggingfaceDownloader(bucket_name = 'tartanair2')
 
     def generate_filelist(self, envs, difficulties, modalities, camera_names): 
         '''
